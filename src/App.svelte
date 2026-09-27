@@ -3,7 +3,7 @@
   import { ProgressBar } from '@skeletonlabs/skeleton'
   import { createSampleProject } from './sample'
   import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import type { Attempt, GroupRange, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -45,6 +45,9 @@
 
   $: selectedGroup = project.groups.find((group) => group.id === selectedGroupId) ?? project.groups[0]
   $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId) ?? project.attempts.at(-1)
+  $: activeRange = selectedAttempt && selectedGroup
+    ? selectedAttempt.groupRanges?.[selectedGroup.id] ?? { start: selectedAttempt.rangeStart, end: selectedAttempt.rangeEnd, locked: false }
+    : { start: 0, end: 0, locked: false }
   $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
   $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
@@ -54,6 +57,56 @@
 
   const clone = <T,>(value: T): T => structuredClone(value)
   const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+  // 按各意群字数与后接停顿加权，把整轮录音时长连续切分给各意群
+  function estimateGroupRanges(groups: SenseGroup[], duration: number) {
+    const weights = groups.map((group) => Math.max(1, group.text.replace(/\s/g, '').length) + group.pauseMs / 100)
+    const total = weights.reduce((sum, weight) => sum + weight, 0) || 1
+    const ranges = new Map<string, GroupRange>()
+    let cursor = 0
+    groups.forEach((group, index) => {
+      const start = cursor
+      cursor = index === groups.length - 1 ? duration : cursor + (duration * weights[index]) / total
+      ranges.set(group.id, { start: Number(start.toFixed(1)), end: Number(cursor.toFixed(1)), locked: false })
+    })
+    return ranges
+  }
+
+  // 重算所有尝试里未锁定的意群范围；手动锁定过的段保持不动
+  function syncGroupRanges() {
+    let changed = false
+    for (const attempt of project.attempts) {
+      const estimates = estimateGroupRanges(project.groups, attempt.duration)
+      const map = { ...(attempt.groupRanges ?? {}) }
+      let attemptChanged = false
+      for (const group of project.groups) {
+        const existing = map[group.id]
+        if (existing?.locked) continue
+        const estimate = estimates.get(group.id)
+        if (!estimate) continue
+        if (!existing || existing.start !== estimate.start || existing.end !== estimate.end) {
+          map[group.id] = estimate
+          attemptChanged = true
+        }
+      }
+      for (const id of Object.keys(map)) {
+        if (!project.groups.some((group) => group.id === id)) {
+          delete map[id]
+          attemptChanged = true
+        }
+      }
+      if (attemptChanged) {
+        attempt.groupRanges = map
+        changed = true
+      }
+    }
+    if (changed) {
+      project = project
+      scheduleSave()
+    }
+  }
+
+  $: if (loaded && project) syncGroupRanges()
 
   function editProject(mutator: (draft: PracticeProject) => void) {
     const before = clone(project)
@@ -214,6 +267,7 @@
       simulated,
       rangeStart: 0,
       rangeEnd: duration,
+      groupRanges: {},
       scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
       wordIssues: [],
       feedback: [],
@@ -239,11 +293,11 @@
       return
     }
     playing = true
-    playbackTime = selectedAttempt.rangeStart
+    playbackTime = activeRange.start
     const url = audioUrlFor(selectedAttempt)
     if (url && audioElement) {
       audioElement.src = url
-      audioElement.currentTime = selectedAttempt.rangeStart
+      audioElement.currentTime = activeRange.start
       audioElement.play().catch(() => startPlaybackTimer())
     } else {
       startPlaybackTimer()
@@ -254,7 +308,7 @@
     window.clearInterval(playbackTimer)
     playbackTimer = window.setInterval(() => {
       playbackTime = Number((playbackTime + 0.1).toFixed(1))
-      if (playbackTime >= (selectedAttempt?.rangeEnd ?? 0)) stopPlayback()
+      if (playbackTime >= activeRange.end) stopPlayback()
     }, 100)
   }
 
@@ -267,7 +321,7 @@
   function onAudioTimeUpdate() {
     if (!audioElement || !selectedAttempt) return
     playbackTime = audioElement.currentTime
-    if (playbackTime >= selectedAttempt.rangeEnd) stopPlayback()
+    if (playbackTime >= activeRange.end) stopPlayback()
   }
 
   function updateScore(field: 'accuracy' | 'rhythm' | 'deviation', value: number) {
@@ -324,15 +378,33 @@
   }
 
   function updateRange(field: 'rangeStart' | 'rangeEnd', value: number) {
-    if (!selectedAttempt) return
+    if (!selectedAttempt || !selectedGroup) return
     editProject((draft) => {
       const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
       if (!attempt) return
-      attempt[field] = value
-      if (attempt.rangeEnd <= attempt.rangeStart) {
-        if (field === 'rangeStart') attempt.rangeEnd = Math.min(attempt.duration, value + 0.5)
-        else attempt.rangeStart = Math.max(0, value - 0.5)
+      attempt.groupRanges ??= {}
+      const current = attempt.groupRanges[selectedGroupId] ?? { start: attempt.rangeStart, end: attempt.rangeEnd, locked: false }
+      const next = { ...current, locked: true }
+      if (field === 'rangeStart') next.start = value
+      else next.end = value
+      if (next.end <= next.start) {
+        if (field === 'rangeStart') next.end = Math.min(attempt.duration, value + 0.5)
+        else next.start = Math.max(0, value - 0.5)
       }
+      attempt.groupRanges[selectedGroupId] = next
+      attempt.rangeStart = next.start
+      attempt.rangeEnd = next.end
+    })
+  }
+
+  function toggleRangeLock() {
+    if (!selectedAttempt || !selectedGroup) return
+    editProject((draft) => {
+      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+      if (!attempt) return
+      attempt.groupRanges ??= {}
+      const current = attempt.groupRanges[selectedGroupId] ?? { start: attempt.rangeStart, end: attempt.rangeEnd, locked: false }
+      attempt.groupRanges[selectedGroupId] = { ...current, locked: !current.locked }
     })
   }
 
@@ -600,11 +672,26 @@
           <audio bind:this={audioElement} src={audioUrlFor(selectedAttempt)} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
           <div class="playback-timeline">
             <div class="playhead" style={`left:${selectedAttempt.duration ? Math.min(100, playbackTime / selectedAttempt.duration * 100) : 0}%`}></div>
-            <span class="range-fill" style={`left:${selectedAttempt.duration ? selectedAttempt.rangeStart / selectedAttempt.duration * 100 : 0}%;right:${selectedAttempt.duration ? 100 - selectedAttempt.rangeEnd / selectedAttempt.duration * 100 : 0}%`}></span>
+            <span class="range-fill" class:locked={activeRange.locked} style={`left:${selectedAttempt.duration ? activeRange.start / selectedAttempt.duration * 100 : 0}%;right:${selectedAttempt.duration ? 100 - activeRange.end / selectedAttempt.duration * 100 : 0}%`}></span>
+          </div>
+          <div class="segment-list">
+            {#each project.groups as group, index (group.id)}
+              {@const range = selectedAttempt.groupRanges?.[group.id]}
+              <button class:active={group.id === selectedGroup?.id} class="segment-item" on:click={() => selectGroup(group.id)}>
+                <span class="segment-index">{String(index + 1).padStart(2, '0')}</span>
+                <span class="segment-text">{group.text}</span>
+                <span class="segment-time">{range ? `${range.start.toFixed(1)}–${range.end.toFixed(1)}s` : '—'}</span>
+                <span class:locked={range?.locked} class="segment-state">{range?.locked ? '锁定' : '估算'}</span>
+              </button>
+            {/each}
           </div>
           <div class="range-controls">
-            <label><span>回听起点 {selectedAttempt.rangeStart.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeStart} on:input={(event) => updateRange('rangeStart', Number(event.currentTarget.value))} /></label>
-            <label><span>回听终点 {selectedAttempt.rangeEnd.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeEnd} on:input={(event) => updateRange('rangeEnd', Number(event.currentTarget.value))} /></label>
+            <label><span>回听起点 {activeRange.start.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={activeRange.start} on:input={(event) => updateRange('rangeStart', Number(event.currentTarget.value))} /></label>
+            <label><span>回听终点 {activeRange.end.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={activeRange.end} on:input={(event) => updateRange('rangeEnd', Number(event.currentTarget.value))} /></label>
+          </div>
+          <div class="range-footer">
+            <button class="btn btn-sm variant-soft" on:click={toggleRangeLock}>{activeRange.locked ? '🔓 解锁本段并重算' : '🔒 锁定本段范围'}</button>
+            <span>点意群自动定位回听段 · 手动拖动即锁定，文字或顺序变动只重算未锁定段</span>
           </div>
           {#if selectedScore}
             <div class="score-grid">
