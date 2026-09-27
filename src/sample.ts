@@ -1,4 +1,5 @@
 import type { PracticeProject } from './types'
+import { syncSegments } from './timing'
 
 export function createSampleProject(): PracticeProject {
   const groups = [
@@ -26,6 +27,7 @@ export function createSampleProject(): PracticeProject {
         simulated: false,
         rangeStart: 2.2,
         rangeEnd: 7.6,
+        segments: syncSegments(groups, 14.8, []),
         scores: groups.map((group, index) => ({ groupId: group.id, accuracy: [78, 72, 66, 74][index], rhythm: [72, 68, 61, 70][index], deviation: [16, 22, 29, 19][index], note: index === 2 ? '第三意群停顿过长。' : '' })),
         wordIssues: [
           { id: 'issue-1', groupId: 'group-2', word: '掠过', category: '声调', note: '去声下探不够明确。' },
@@ -47,6 +49,7 @@ export function createSampleProject(): PracticeProject {
         simulated: false,
         rangeStart: 1.5,
         rangeEnd: 6.8,
+        segments: syncSegments(groups, 13.6, []),
         scores: groups.map((group, index) => ({ groupId: group.id, accuracy: [83, 79, 75, 78][index], rhythm: [78, 76, 72, 77][index], deviation: [10, 13, 17, 13][index], note: index === 2 ? '停顿仍略长。' : '' })),
         wordIssues: [
           { id: 'issue-3', groupId: 'group-3', word: '信', category: '韵尾', note: '比上一轮稳定。' }

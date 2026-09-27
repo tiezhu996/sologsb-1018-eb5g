@@ -3,7 +3,8 @@
   import { ProgressBar } from '@skeletonlabs/skeleton'
   import { createSampleProject } from './sample'
   import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import { normalizeProject, segmentWindow, spokenCount, syncSegments } from './timing'
+  import type { Attempt, GroupTiming, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -46,6 +47,14 @@
   $: selectedGroup = project.groups.find((group) => group.id === selectedGroupId) ?? project.groups[0]
   $: selectedAttempt = project.attempts.find((attempt) => attempt.id === selectedAttemptId) ?? project.attempts.at(-1)
   $: selectedScore = selectedAttempt && selectedGroup ? selectedAttempt.scores.find((score) => score.groupId === selectedGroup?.id) : undefined
+  $: segmentByGroup = new Map((selectedAttempt?.segments ?? []).map((segment) => [segment.groupId, segment]))
+  $: currentSegment = selectedGroup ? segmentByGroup.get(selectedGroup.id) : undefined
+  $: playbackWindow = segmentWindow(selectedAttempt, selectedGroup?.id ?? '')
+  // 时间轴色块按当前意群顺序排列，锁过的段即使顺序变动也钉在原录音秒数上
+  $: orderedSegments = project.groups.map((group) => segmentByGroup.get(group.id)).filter((segment): segment is GroupTiming => Boolean(segment))
+  function timingOf(attempt: Attempt | undefined, groupId: string) {
+    return attempt?.segments?.find((segment) => segment.groupId === groupId)
+  }
   $: completedAttempts = Math.min(project.attempts.length, project.targetAttempts)
   $: progress = Math.round((completedAttempts / Math.max(project.targetAttempts, 1)) * 100)
   $: averageAccuracy = selectedAttempt?.scores.length ? Math.round(selectedAttempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / selectedAttempt.scores.length) : 0
@@ -75,6 +84,13 @@
     }, 250)
   }
 
+  /** 意群文字/字数/停顿/顺序/增删变化后，逐轮重算未锁定段；手动锁过的段保持不动。 */
+  function refreshDraftSegments(draft: PracticeProject) {
+    draft.attempts.forEach((attempt) => {
+      attempt.segments = syncSegments(draft.groups, attempt.duration, attempt.segments ?? [])
+    })
+  }
+
   function undo() {
     const target = undoStack.pop()
     if (!target) return
@@ -101,6 +117,7 @@
       const group = draft.groups.find((item) => item.id === selectedGroupId)
       if (!group) return
       ;(group as unknown as Record<string, unknown>)[field] = value
+      if (field === 'text' || field === 'pauseMs') refreshDraftSegments(draft)
     })
   }
 
@@ -122,6 +139,7 @@
     const id = uid('group')
     editProject((draft) => {
       draft.groups.push({ id, text: '新的意群', stressWords: [], stressLevel: 1, pauseMs: 300, intonation: 'flat', note: '' })
+      refreshDraftSegments(draft)
     })
     selectedGroupId = id
   }
@@ -129,7 +147,10 @@
   function deleteGroup() {
     if (!selectedGroup || project.groups.length <= 1) return
     const index = project.groups.findIndex((group) => group.id === selectedGroup.id)
-    editProject((draft) => { draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id) })
+    editProject((draft) => {
+      draft.groups = draft.groups.filter((group) => group.id !== selectedGroup?.id)
+      refreshDraftSegments(draft)
+    })
     selectedGroupId = project.groups[Math.max(0, index - 1)]?.id ?? ''
   }
 
@@ -141,6 +162,7 @@
     editProject((draft) => {
       const [group] = draft.groups.splice(index, 1)
       draft.groups.splice(next, 0, group)
+      refreshDraftSegments(draft)
     })
   }
 
@@ -157,6 +179,7 @@
         intonation: draft.groups[index]?.intonation ?? 'flat',
         note: draft.groups[index]?.note ?? ''
       }))
+      refreshDraftSegments(draft)
     })
     selectedGroupId = project.groups[0]?.id ?? ''
   }
@@ -214,6 +237,7 @@
       simulated,
       rangeStart: 0,
       rangeEnd: duration,
+      segments: syncSegments(project.groups, duration, []),
       scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
       wordIssues: [],
       feedback: [],
@@ -239,11 +263,11 @@
       return
     }
     playing = true
-    playbackTime = selectedAttempt.rangeStart
+    playbackTime = playbackWindow.start
     const url = audioUrlFor(selectedAttempt)
     if (url && audioElement) {
       audioElement.src = url
-      audioElement.currentTime = selectedAttempt.rangeStart
+      audioElement.currentTime = playbackWindow.start
       audioElement.play().catch(() => startPlaybackTimer())
     } else {
       startPlaybackTimer()
@@ -254,7 +278,7 @@
     window.clearInterval(playbackTimer)
     playbackTimer = window.setInterval(() => {
       playbackTime = Number((playbackTime + 0.1).toFixed(1))
-      if (playbackTime >= (selectedAttempt?.rangeEnd ?? 0)) stopPlayback()
+      if (playbackTime >= playbackWindow.end) stopPlayback()
     }, 100)
   }
 
@@ -267,7 +291,7 @@
   function onAudioTimeUpdate() {
     if (!audioElement || !selectedAttempt) return
     playbackTime = audioElement.currentTime
-    if (playbackTime >= selectedAttempt.rangeEnd) stopPlayback()
+    if (playbackTime >= playbackWindow.end) stopPlayback()
   }
 
   function updateScore(field: 'accuracy' | 'rhythm' | 'deviation', value: number) {
@@ -333,7 +357,51 @@
         if (field === 'rangeStart') attempt.rangeEnd = Math.min(attempt.duration, value + 0.5)
         else attempt.rangeStart = Math.max(0, value - 0.5)
       }
+      // 手动拖过的段锁定在本次录音的秒数上，之后改文字或顺序都不会被重算冲掉
+      if (!selectedGroupId) return
+      let segment = attempt.segments?.find((item) => item.groupId === selectedGroupId)
+      if (!attempt.segments) attempt.segments = syncSegments(draft.groups, attempt.duration, [])
+      if (!segment) {
+        attempt.segments = syncSegments(draft.groups, attempt.duration, attempt.segments)
+        segment = attempt.segments.find((item) => item.groupId === selectedGroupId)
+      }
+      if (!segment) return
+      const segmentField = field === 'rangeStart' ? 'start' : 'end'
+      segment[segmentField] = value
+      segment.locked = true
+      if (segment.end <= segment.start) {
+        if (segmentField === 'start') segment.end = Math.min(attempt.duration, value + 0.5)
+        else segment.start = Math.max(0, value - 0.5)
+      }
     })
+  }
+
+  function toggleSegmentLock() {
+    if (!selectedAttempt || !selectedGroupId) return
+    editProject((draft) => {
+      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+      const segment = attempt?.segments?.find((item) => item.groupId === selectedGroupId)
+      if (!attempt || !segment) return
+      segment.locked = !segment.locked
+      // 解锁瞬间按当前字数与停顿重新估算
+      attempt.segments = syncSegments(draft.groups, attempt.duration, attempt.segments)
+    })
+  }
+
+  function unlockAllSegments() {
+    if (!selectedAttempt) return
+    editProject((draft) => {
+      const attempt = draft.attempts.find((item) => item.id === selectedAttemptId)
+      if (!attempt) return
+      attempt.segments = syncSegments(draft.groups, attempt.duration, attempt.segments?.map((segment) => ({ ...segment, locked: false })))
+    })
+  }
+
+  function selectTimelineGroup(groupId: string) {
+    if (groupId !== selectedGroupId) {
+      selectedGroupId = groupId
+      stopPlayback()
+    }
   }
 
   function addCategory() {
@@ -344,7 +412,8 @@
 
   function resetSample() {
     if (!confirm('恢复示例会替换当前练习，确定继续吗？')) return
-    editProject((draft) => { Object.assign(draft, clone(createSampleProject())) })
+    const sample = normalizeProject(createSampleProject())
+    editProject((draft) => { Object.assign(draft, clone(sample)) })
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
   }
@@ -353,7 +422,7 @@
     if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
     stopPlayback()
     await clearPractice()
-    const sample = createSampleProject()
+    const sample = normalizeProject(createSampleProject())
     project = sample
     selectedGroupId = sample.groups[0]?.id ?? ''
     selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
@@ -390,11 +459,12 @@
   onMount(async () => {
     online = navigator.onLine
     const saved = await loadPractice()
-    if (saved) project = saved
+    if (saved) project = normalizeProject(saved)
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
     loaded = true
     saveStatus = saved ? '已恢复本机练习' : '示例练习已就绪'
+    if (saved) scheduleSave()
     window.addEventListener('online', () => { online = true })
     window.addEventListener('offline', () => { online = false })
     window.addEventListener('keydown', onKeydown)
@@ -478,6 +548,11 @@
             <span class="group-copy">
               <strong>{group.text}</strong>
               <small>重音 {group.stressWords.join('、') || '未设'} · 停 {group.pauseMs}ms · {intonationOptions.find((item) => item.value === group.intonation)?.label}</small>
+              {#if timingOf(selectedAttempt, group.id)}
+                <small class:locked={timingOf(selectedAttempt, group.id)?.locked} class="segment-mark">
+                  {timingOf(selectedAttempt, group.id)?.locked ? '🔒 ' : ''}本段 {timingOf(selectedAttempt, group.id)?.start.toFixed(1)}–{timingOf(selectedAttempt, group.id)?.end.toFixed(1)}s · {spokenCount(group.text)} 字
+                </small>
+              {/if}
             </span>
           </button>
         {/each}
@@ -598,14 +673,46 @@
             <button class="btn btn-sm variant-filled-primary" on:click={togglePlayback}>{playing ? '■ 停止' : '▶ 播放范围'}</button>
           </div>
           <audio bind:this={audioElement} src={audioUrlFor(selectedAttempt)} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
+          <div class="segment-strip">
+            {#each orderedSegments as segment (segment.groupId)}
+              {@const group = project.groups.find((item) => item.id === segment.groupId)}
+              {#if group}
+                <button
+                  class:active={segment.groupId === selectedGroupId}
+                  class:locked={segment.locked}
+                  class="segment-block"
+                  style={`left:${selectedAttempt.duration ? segment.start / selectedAttempt.duration * 100 : 0}%;width:${selectedAttempt.duration ? Math.max(0, (segment.end - segment.start) / selectedAttempt.duration * 100) : 0}%`}
+                  title={`${group.text}（${segment.start.toFixed(1)}–${segment.end.toFixed(1)}s）`}
+                  on:click={() => selectTimelineGroup(segment.groupId)}
+                >
+                  <span class="segment-time">{segment.start.toFixed(1)}</span>
+                  <span class="segment-lock">{segment.locked ? '🔒' : ''}</span>
+                </button>
+              {/if}
+            {/each}
+          </div>
           <div class="playback-timeline">
             <div class="playhead" style={`left:${selectedAttempt.duration ? Math.min(100, playbackTime / selectedAttempt.duration * 100) : 0}%`}></div>
-            <span class="range-fill" style={`left:${selectedAttempt.duration ? selectedAttempt.rangeStart / selectedAttempt.duration * 100 : 0}%;right:${selectedAttempt.duration ? 100 - selectedAttempt.rangeEnd / selectedAttempt.duration * 100 : 0}%`}></span>
+            <span class="range-fill" style={`left:${selectedAttempt.duration ? playbackWindow.start / selectedAttempt.duration * 100 : 0}%;right:${selectedAttempt.duration ? 100 - playbackWindow.end / selectedAttempt.duration * 100 : 0}%`}></span>
           </div>
+          {#if currentSegment}
+            <div class="segment-detail">
+              <div class="segment-detail-copy">
+                <strong>{selectedGroup?.text}</strong>
+                <span>本段 {currentSegment.start.toFixed(1)}s – {currentSegment.end.toFixed(1)}s（{(currentSegment.end - currentSegment.start).toFixed(1)}s）</span>
+                <small>{currentSegment.locked ? '已手动锁定，改文字或调整意群顺序都保留这段秒数' : '按字数与后接停顿估算，拖动滑块可锁定'}</small>
+              </div>
+              <div class="segment-actions">
+                <button class="btn btn-sm variant-ghost" on:click={toggleSegmentLock}>{currentSegment.locked ? '解锁本段' : '锁定本段'}</button>
+                <button class="btn btn-sm variant-ghost" on:click={unlockAllSegments}>全部解锁重算</button>
+              </div>
+            </div>
+          {/if}
           <div class="range-controls">
-            <label><span>回听起点 {selectedAttempt.rangeStart.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeStart} on:input={(event) => updateRange('rangeStart', Number(event.currentTarget.value))} /></label>
-            <label><span>回听终点 {selectedAttempt.rangeEnd.toFixed(1)}s</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={selectedAttempt.rangeEnd} on:input={(event) => updateRange('rangeEnd', Number(event.currentTarget.value))} /></label>
+            <label><span>本段起点 {playbackWindow.start.toFixed(1)}s{currentSegment?.locked ? ' 🔒' : ''}</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={playbackWindow.start} on:input={(event) => updateRange('rangeStart', Number(event.currentTarget.value))} /></label>
+            <label><span>本段终点 {playbackWindow.end.toFixed(1)}s{currentSegment?.locked ? ' 🔒' : ''}</span><input class="range" type="range" min="0" max={selectedAttempt.duration} step="0.1" value={playbackWindow.end} on:input={(event) => updateRange('rangeEnd', Number(event.currentTarget.value))} /></label>
           </div>
+          <p class="range-hint">点左侧意群或上方色块，回听范围就落到该段；滑块拖过即锁定，其他段重算不会影响它。</p>
           {#if selectedScore}
             <div class="score-grid">
               <label><span>准确度 {selectedScore.accuracy}%</span><input class="range" type="range" min="0" max="100" value={selectedScore.accuracy} on:input={(event) => updateScore('accuracy', Number(event.currentTarget.value))} /></label>

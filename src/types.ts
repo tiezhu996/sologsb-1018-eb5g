@@ -27,6 +27,13 @@ export interface WordIssue {
   note: string
 }
 
+export interface GroupTiming {
+  groupId: string
+  start: number
+  end: number
+  locked: boolean
+}
+
 export interface SegmentFeedback {
   id: string
   groupId: string
@@ -46,6 +53,7 @@ export interface Attempt {
   simulated: boolean
   rangeStart: number
   rangeEnd: number
+  segments?: GroupTiming[]
   scores: GroupScore[]
   wordIssues: WordIssue[]
   feedback: SegmentFeedback[]
